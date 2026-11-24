@@ -1,7 +1,8 @@
 """User-run local browser. Backend receives HTML; database credentials stay in Docker."""
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
-import fcntl
+import errno
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -14,6 +15,11 @@ import traceback
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, build_opener, ProxyHandler
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 from app.catalog_navigation import CURRENT_PAGE_SELECTOR, catalog_page, page_in_url
 from app.browser_protocol import LEASE_LOST, PROTOCOL_VERSION
@@ -108,7 +114,7 @@ def default_api_url():
     port = os.environ.get("WEB_PORT", "8088")
     env = ROOT / ".env"
     if "WEB_PORT" not in os.environ and env.exists():
-        match = re.search(r'^\s*WEB_PORT\s*=\s*[\'"]?(\d+)', env.read_text(), re.M)
+        match = re.search(r'^\s*WEB_PORT\s*=\s*[\'"]?(\d+)', env.read_text(encoding="utf-8-sig"), re.M)
         if match:
             port = match[1]
     return f"http://127.0.0.1:{port}/api"
@@ -510,23 +516,39 @@ def execute_job(runner):
     return not stopped
 
 
+@contextmanager
+def browser_lock(path):
+    # Keep the lock file in place and let the OS release the lock when the handle closes.
+    with path.open("ab") as lock:
+        lock.seek(0)
+        try:
+            if os.name == "nt":
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                raise
+            yield False
+        else:
+            yield True
+
+
 def main():
     parser = argparse.ArgumentParser(description="Бесплатный локальный браузерный сборщик. CAPTCHA проходит пользователь.")
     parser.add_argument("--api-url", default=default_api_url())
     parser.add_argument("--profile-dir", type=Path, default=ROOT / ".runtime" / "browser-profile")
     args = parser.parse_args()
     args.profile_dir.parent.mkdir(parents=True, exist_ok=True)
-    handler = RotatingFileHandler(args.profile_dir.parent / "collector-errors.log", maxBytes=2_000_000,
-                                  backupCount=2, encoding="utf-8")
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    LOGGER.addHandler(handler)
-    LOGGER.setLevel(logging.INFO)
-    with (args.profile_dir.parent / "browser.lock").open("w") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+    with browser_lock(args.profile_dir.parent / "browser.lock") as acquired:
+        if not acquired:
             print("Локальный сборщик уже запущен.")
             return
+        handler = RotatingFileHandler(args.profile_dir.parent / "collector-errors.log", maxBytes=2_000_000,
+                                      backupCount=2, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        LOGGER.addHandler(handler)
+        LOGGER.setLevel(logging.INFO)
         api = LocalAPI(args.api_url)
         try:
             api.call("/health")
@@ -535,7 +557,7 @@ def main():
         try:
             from playwright.sync_api import sync_playwright, TimeoutError as NavigationTimeout, Error as BrowserError
         except ImportError:
-            parser.exit(1, "Установите requirements-browser.txt или откройте файл «Запустить сборщик.command».\n")
+            parser.exit(1, "Для установки Playwright запустите сборщик по инструкции в README.md.\n")
         token = secrets.token_hex(16)
         chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
         with sync_playwright() as playwright:
@@ -544,8 +566,10 @@ def main():
                 options["channel"] = "chrome"
             try:
                 context = playwright.chromium.launch_persistent_context(str(args.profile_dir), **options)
-            except Exception:
-                parser.exit(1, "Не удалось открыть браузер. Закройте предыдущий сборщик и повторите запуск через .command.\n")
+            except BrowserError as exc:
+                LOGGER.error("Не удалось открыть браузер: %s", diagnostic_text(exc))
+                parser.exit(1, "Не удалось открыть браузер. Проверьте требования в BROWSER_SETUP.md. "
+                               "Подробности в collector-errors.log рядом с папкой профиля.\n")
             try:
                 page = context.pages[0] if context.pages else context.new_page()
                 print("Сборщик готов. Нажмите «Запустить сбор» в веб-интерфейсе. Проверку Авито проходите вручную в отдельном окне.", flush=True)
