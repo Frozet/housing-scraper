@@ -1,0 +1,58 @@
+name: housing-scraper
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: avito
+      POSTGRES_USER: avito
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-avito_local_only}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U avito -d avito"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://avito:${POSTGRES_PASSWORD:-avito_local_only}@db:5432/avito
+      REQUEST_DELAY_SECONDS: ${REQUEST_DELAY_SECONDS:-5}
+      MAX_PAGES: ${MAX_PAGES:-0}
+      MAX_LISTINGS: ${MAX_LISTINGS:-0}
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-30}
+      AVITO_PROXY_URL: ${AVITO_PROXY_URL:-}
+      AVITO_PROXY_REQUIRED: ${AVITO_PROXY_REQUIRED:-false}
+      COLLECTOR_MODE: ${COLLECTOR_MODE:-browser}
+      BROWSER_WAIT_SECONDS: ${BROWSER_WAIT_SECONDS:-300}
+      MAP_OVERPASS_URL: ${MAP_OVERPASS_URL:-https://maps.mail.ru/osm/tools/overpass/api/interpreter}
+      MAP_TILE_URL: ${MAP_TILE_URL:-https://tile.openstreetmap.org/{z}/{x}/{y}.png}
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+  frontend:
+    build: ./frontend
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8088}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+  backend-test:
+    profiles: ["test"]
+    build:
+      context: ./backend
+      target: test
+    environment:
+      DATABASE_URL: postgresql+psycopg://avito:${POSTGRES_PASSWORD:-avito_local_only}@db:5432/avito_test
+      WORKER_ENABLED: "false"
+    command: ["pytest", "-q", "-p", "no:cacheprovider"]
+volumes:
+  postgres_data:

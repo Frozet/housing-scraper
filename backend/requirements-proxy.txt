@@ -1,0 +1,2 @@
+# Optional HTTPX dependency for SOCKS5 / SOCKS5h; HTTP CONNECT needs no extra package.
+socksio==1.0.0

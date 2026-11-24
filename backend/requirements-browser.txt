@@ -1,0 +1,2 @@
+# Local macOS helper only; browser runs on the user's computer, outside Docker.
+playwright==1.64.0
